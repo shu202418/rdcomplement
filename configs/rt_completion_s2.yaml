@@ -1,0 +1,48 @@
+# Run from the project root. This is a runnable research baseline, not a
+# reproduction of LiDAR-to-4D Radar Synthesis, and not yet tuned for accuracy.
+data:
+  cache_path: MR-Mesh/rf3dpose_all
+  scale: p1
+  protocol: s2
+  shape: [121, 111, 31]  # X, Y, Z (NOT Z, Y, X)
+  bounds: [[-3.0, 3.0], [0.5, 6.0], [0.0, 3.0]]  # meters
+  window: 4  # causal: t-3, t-2, t-1, t; repeat boundary, never cross split
+  intensity_scale: 1.0
+  intensity_cap: 10.0  # network normalization/output only; preserve raw RT exactly
+
+model:
+  encoder: dense  # Shared lightweight Conv3d baseline; NOT sparse convolution
+  base_channels: 8
+  capsule_radius_m: 0.16
+
+mask:
+  drop_probability: 0.25
+  block_probability: 0.7
+  block_shape: [15, 15, 9]  # same cuboid erased across all input frames
+
+loss:
+  observed_weight: 0.05
+  reflection_weight: 1.0
+  temporal_weight: 0.10
+  temporal_min_support: 2  # two distinct previous frames; padding doesn't count
+  joint_weight: 1.0
+  sparsity_weight: 0.03  # weak prior on unknown voxels, not a negative GT label
+
+train:
+  seed: 42
+  epochs: 30
+  batch_size: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  amp: true
+  log_every: 50
+  selection_joint_weight: 0.1  # val masked MAE(log intensity) + weight * MPJPE(m)
+
+export:
+  probability_threshold: 0.8
+  body_threshold: 0.25
+  max_sigma_log: 0.6  # learned sigma in log1p space; NOT calibrated confidence
+  min_intensity: 0.02
+  max_added_voxels: 2048  # limits densification; tune on val, never test
+  map_size_gb: 8  # grows on demand; NOT a preallocated dense RT copy

@@ -1,0 +1,28 @@
+experiments/
+models/
+mmwave_models/Point_models/mamba_models
+# 数据集和生成数据
+MR-Mesh/
+
+# 模型与训练结果
+models/
+experiments/
+logs/
+*.pth
+*.pt
+*.ckpt
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地工具和敏感配置
+.aws/
+.codex/
+.agents/
+.vscode/
+.idea/
+
+# 项目中特定的大模型目录
+mmwave_models/Point_models/mamba_models/

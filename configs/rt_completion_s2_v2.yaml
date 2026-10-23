@@ -1,0 +1,80 @@
+# Three scoped upgrades. Old configs/checkpoints remain baseline-compatible.
+# Data section is identical to v1, so existing train/val joint labels are reusable.
+data:
+  cache_path: MR-Mesh/rf3dpose_all
+  scale: p1
+  protocol: s2
+  shape: [121, 111, 31]
+  bounds: [[-3.0, 3.0], [0.5, 6.0], [0.0, 3.0]]
+  window: 4
+  intensity_scale: 1.0
+  intensity_cap: 10.0
+
+model:
+  architecture: reliability_v2
+  encoder: dense
+  base_channels: 8
+  capsule_radius_m: 0.16
+  feature_radius_scale: 1.0  # feature-cell extent; physical capsules keep .16 m
+  feature_support_threshold: 0.01
+  joint_variance_floor: 0.0001  # diagonal coordinate variance, meters squared
+
+mask:
+  mode: mixed_parts
+  group_weights: {random: 0.35, single_part: 0.30, continuous_part: 0.25, spatial_block: 0.10}
+  drop_probability: 0.25
+  block_probability: 0.7
+  block_shape: [15, 15, 9]
+  part_radius: 0.16
+  radius_jitter: 0.15
+  joint_jitter_m: 0.015
+  continuous_min_frames: 2
+  continuous_max_frames: 4
+
+loss:
+  observed_weight: 0.05
+  reflection_weight: 1.0
+  temporal_weight: 0.10
+  temporal_alignment: articulated
+  temporal_min_support: 2
+  temporal_support_threshold: 0.25
+  temporal_body_threshold: 0.25
+  temporal_consistency_scale: 0.35
+  temporal_alignment_scale: 0.5
+  temporal_min_intensity: 0.000001
+  joint_weight: 1.0
+  joint_uncertainty_weight: 0.01
+  quality_weight: 0.05
+  quality_error_scale: 0.15
+  sparsity_weight: 0.03
+
+validation:
+  # Each frame/group gets a SHA256-derived mask seed, stable across epochs/batches.
+  groups: [random, single_part, continuous_part, spatial_block]
+  seed: 100042
+
+train:
+  seed: 42
+  epochs: 30
+  batch_size: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  amp: true
+  amp_dtype: auto  # BF16 on RTX 3090: no GradScaler; FP16 fallback uses scaling
+  retry_fp32: true  # retry an AMP-unsafe batch once without autocast
+  checkpoint_every_steps: 1000  # progress.pt also after step 1 and before val
+  max_nonfinite_batches: 20  # per epoch, excluding successful FP32 retries
+  max_consecutive_nonfinite: 3
+  max_failure_snapshots: 3
+  log_every: 50
+  detailed_metrics_every: 0  # 0: scalar-only train; >0: sampled diagnostics every N batches; val remains full
+  selection_joint_weight: 0.1
+
+export:
+  probability_threshold: 0.8  # legacy name: uncalibrated reflection score
+  body_threshold: 0.25
+  max_sigma_log: 0.6
+  min_intensity: 0.02
+  max_added_voxels: 2048
+  map_size_gb: 8
