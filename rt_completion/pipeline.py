@@ -16,10 +16,10 @@ import yaml
 
 from dataset.lmdb_utils import unpack_dict_np
 from . import FORMAT_VERSION
-from .data import RTSequenceDataset, causal_window, load_splits
+from .data import RTSequenceDataset, causal_window, deterministic_subset, load_splits
 from .diagnostics import write_numerics_event
 from .evaluation import GroupMetrics, MASK_GROUPS, fixed_corruption
-from .losses import completion_loss, corrupt_rt
+from .losses import ALL_MASK_GROUPS, completion_loss, corrupt_rt
 from .model import RTCompletionNet
 from .numerics import (graceful_load_scaler, make_grad_scaler, precision_policy,
                        safe_optimizer_step)
@@ -47,12 +47,20 @@ def load_config(path):
     architecture = config["model"].get("architecture", "baseline")
     if architecture not in ("baseline", "reliability_v2"):
         raise ValueError(f"Unknown completion architecture: {architecture}")
+    surface = config["model"].get("surface_prior", {})
+    if surface.get("enabled", False):
+        if architecture != "reliability_v2":
+            raise ValueError("surface_prior requires architecture=reliability_v2")
+        if int(surface.get("num_points", 0)) < 4 or float(surface.get("heatmap_radius_m", 0)) <= 0:
+            raise ValueError("surface_prior requires num_points >= 4 and positive heatmap_radius_m")
+        if float(config["loss"].get("surface_weight", 0)) <= 0:
+            raise ValueError("surface_prior requires positive loss.surface_weight")
     groups = config.get("validation", {}).get("groups", [])
-    if groups and (len(set(groups)) != len(groups) or any(group not in MASK_GROUPS for group in groups)):
+    if groups and (len(set(groups)) != len(groups) or any(group not in ALL_MASK_GROUPS for group in groups)):
         raise ValueError("validation.groups must contain distinct supported mask groups")
     if config["mask"].get("mode") == "mixed_parts":
         weights = config["mask"].get("group_weights", {})
-        if weights and (set(weights) - set(MASK_GROUPS)
+        if weights and (set(weights) - set(ALL_MASK_GROUPS)
                         or any(float(value) < 0 for value in weights.values())
                         or sum(float(value) for value in weights.values()) <= 0):
             raise ValueError("Invalid mixed mask group weights")
@@ -68,6 +76,23 @@ def load_config(path):
     if settings.get("amp_dtype", "auto") not in ("auto", "float32", "float16", "bfloat16"):
         raise ValueError("Invalid train.amp_dtype")
     return config
+
+
+def farthest_point_vertex_indices(vertices, count):
+    """Deterministic topology indices selected once from the SMPL-X template."""
+    vertices = torch.as_tensor(vertices, dtype=torch.float32, device="cpu")
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not 1 <= count <= len(vertices):
+        raise ValueError("invalid template vertices or surface-point count")
+    centre = vertices.mean(0, keepdim=True)
+    first = int((vertices - centre).square().sum(-1).argmax())
+    chosen = torch.empty(count, dtype=torch.long)
+    chosen[0] = first
+    distance = (vertices - vertices[first]).square().sum(-1)
+    for index in range(1, count):
+        selected = int(distance.argmax())
+        chosen[index] = selected
+        distance = torch.minimum(distance, (vertices - vertices[selected]).square().sum(-1))
+    return chosen
 
 
 def choose_device(name):
@@ -143,8 +168,20 @@ def prepare_labels(args):
     data = config["data"]
     device = choose_device(args.device)
     smplx_root = Path(args.smplx_models).resolve()
+    models = {sex: smplx.create(str(smplx_root), model_type="smplx", gender=sex).to(device).eval()
+              for sex in ("male", "female")}
+    surface = config["model"].get("surface_prior", {})
+    surface_count = int(surface.get("num_points", 0)) if surface.get("enabled", False) else 0
+    surface_indices = (farthest_point_vertex_indices(models["male"].v_template.detach().cpu(), surface_count)
+                       if surface_count else None)
     signature = {"source": source_identity(data["cache_path"]), "data": data,
                  "smplx_models": str(smplx_root), "units": "radar_space_meters"}
+    if surface_count:
+        signature["supervision"] = {
+            "joints": 22, "surface_points": surface_count,
+            "surface_vertex_indices": surface_indices.tolist(),
+            "selection": "deterministic_template_farthest_point",
+        }
     # Calibration/parameter changes invalidate label-resume as well.
     signature["label_sources"] = {}
     for path in [Path(data["cache_path"]) / name for name in ("params.lmdb", "calib.lmdb")] + [
@@ -153,8 +190,6 @@ def prepare_labels(args):
         stat = path.stat()
         signature["label_sources"][str(path)] = [stat.st_size, stat.st_mtime_ns]
     splits = load_splits(data)
-    models = {sex: smplx.create(str(smplx_root), model_type="smplx", gender=sex).to(device).eval()
-              for sex in ("male", "female")}
     male_subjects = {2, 5, 6, 9, 11, 12, 14, 16, 17, 18, 19, 20}
     with output_lock(args.output, data["cache_path"]) as output:
         manifest = init_manifest(output, "rt_joint_labels", signature, args.resume)
@@ -163,7 +198,12 @@ def prepare_labels(args):
             existing = writer.keys()
             for split in ("train", "val"):
                 allowed = set(splits[split])
-                targets = splits[split][:args.limit] if args.limit else splits[split]
+                fraction = getattr(args, f"{split}_fraction", None)
+                sampling_seed = getattr(args, "sampling_seed", config["train"]["seed"])
+                sampling_seed += 0 if split == "train" else 100000
+                targets = deterministic_subset(
+                    splits[split], fraction, sampling_seed)
+                targets = targets[:args.limit] if args.limit else targets
                 needed = sorted({key for target in targets for key in causal_window(target, allowed, data["window"])})
                 pending = [key for key in needed if frame_key(key) not in existing]
                 print(f"Labels {split}: {len(pending)} pending / {len(needed)} requested", flush=True)
@@ -201,17 +241,29 @@ def prepare_labels(args):
                             # Same J_regressor[:22] @ vertices as RF3DPoseDataset,
                             # not SMPL-X's differently ordered output.joints list.
                             joints = torch.einsum("jv,bvc->bjc", models[sex].J_regressor[:22], mesh.vertices)
-                        for (key, _), array in zip(group, joints.cpu().numpy()):
+                            selected_surface = (mesh.vertices[:, surface_indices.to(mesh.vertices.device)]
+                                                if surface_indices is not None else None)
+                        for item_index, ((key, _), array) in enumerate(zip(group, joints.cpu().numpy())):
                             if not np.isfinite(array).all():
                                 raise ValueError(f"Non-finite SMPL-X joints for {key}")
-                            records.append((key, {"joints": array.astype(np.float32)}))
+                            record = {"joints": array.astype(np.float32)}
+                            if selected_surface is not None:
+                                points = selected_surface[item_index].cpu().numpy().astype(np.float32)
+                                if not np.isfinite(points).all():
+                                    raise ValueError(f"Non-finite SMPL-X surface for {key}")
+                                record["surface_points"] = points
+                            records.append((key, record))
                     writer.put_many(records)
                     existing.update(frame_key(key) for key, _ in records)
                     if start == 0 or (start // args.batch_size + 1) % 100 == 0:
                         print(f"  {split}: {min(start + args.batch_size, len(pending))}/{len(pending)}", flush=True)
                 done = sum(frame_key(key) in existing for key in splits[split])
+                requested_done = sum(frame_key(key) in existing for key in targets)
                 manifest["partitions"][split] = {"expected": len(splits[split]), "written": done,
-                                                  "complete": done == len(splits[split])}
+                                                  "complete": done == len(splits[split]),
+                                                  "requested": len(targets),
+                                                  "requested_written": requested_done,
+                                                  "requested_complete": requested_done == len(targets)}
                 atomic_json(output / "manifest.json", manifest)
             manifest["state"] = "complete" if all(p["complete"] for p in manifest["partitions"].values()) else "partial"
             atomic_json(output / "manifest.json", manifest)
@@ -220,22 +272,28 @@ def prepare_labels(args):
     print(f"Joint labels: {output} ({manifest['state']}); no test labels generated", flush=True)
 
 
-def _batch_forward(model, corrupted, raw, masked, joints, history, config, policy, temporal_teacher=None):
+def _batch_forward(model, corrupted, raw, masked, joints, history, config, policy,
+                   temporal_teacher=None, surface_points=None):
     with torch.autocast(device_type=raw.device.type, dtype=policy["dtype"], enabled=policy["enabled"]):
         prediction = model(corrupted, history_valid=history)
     teacher_options = {"temporal_teacher": temporal_teacher} if temporal_teacher is not None else {}
-    loss, metrics = completion_loss(prediction, raw, masked, joints, history, model, config["loss"],
-                                    **teacher_options)
+    if surface_points is not None:
+        teacher_options["surface_points"] = surface_points
+    loss, metrics = completion_loss(
+        prediction, raw, masked, joints, history, model, config["loss"],
+        **teacher_options)
     return prediction, loss, metrics
 
 
 def _training_batch(model, optimizer, corrupted, raw, masked, joints, history, indicators,
-                    config, policy, epoch, step, diagnostic_dir, temporal_teacher=None):
+                    config, policy, epoch, step, diagnostic_dir, temporal_teacher=None,
+                    surface_points=None):
     """Never step with bad gradients; optionally retry the same inputs in FP32."""
     scaler = model._training_scaler
     optimizer.zero_grad(set_to_none=True)
-    prediction, loss, metrics = _batch_forward(model, corrupted, raw, masked, joints, history, config, policy,
-                                             temporal_teacher)
+    prediction, loss, metrics = _batch_forward(
+        model, corrupted, raw, masked, joints, history, config, policy,
+        temporal_teacher, surface_points)
     if bool(torch.isfinite(loss)):
         scaler.scale(loss).backward()
         status = safe_optimizer_step(model, optimizer, scaler, config["train"]["grad_clip"])
@@ -257,7 +315,8 @@ def _training_batch(model, optimizer, corrupted, raw, masked, joints, history, i
         del prediction, loss, metrics
         full_precision = {"enabled": False, "dtype": torch.float32}
         prediction, loss, metrics = _batch_forward(
-            model, corrupted, raw, masked, joints, history, config, full_precision, temporal_teacher)
+            model, corrupted, raw, masked, joints, history, config, full_precision,
+            temporal_teacher, surface_points)
         if bool(torch.isfinite(loss)):
             loss.backward()
             retry_scaler = torch.amp.GradScaler(raw.device.type, enabled=False)
@@ -273,6 +332,7 @@ def _training_batch(model, optimizer, corrupted, raw, masked, joints, history, i
     if diagnostic_dir is not None:
         write_numerics_event(diagnostic_dir, event,
                              {"raw": raw, "corrupted": corrupted, "mask": masked, "joints": joints,
+                              "surface_points": surface_points,
                               "history_valid": history, "indicators": indicators},
                              max_snapshots=config["train"].get("max_failure_snapshots", 3))
     print(f"WARNING: Epoch [{epoch + 1}/{config['train']['epochs']}] step {step + 1}: "
@@ -372,17 +432,20 @@ def run_epoch(model, batches, config, device, epoch, optimizer=None, max_steps=N
             break
         raw = batch["rt"].to(device, non_blocking=True)
         joints = batch["joints"].to(device, non_blocking=True)
+        surfaces = (batch["surface_points"].to(device, non_blocking=True)
+                    if "surface_points" in batch else None)
         history = batch["history_valid"].to(device, non_blocking=True)
         corrupted, masked = corrupt_rt(raw, config["mask"], mask_rng)
         with torch.set_grad_enabled(training):
             if training:
                 prediction, loss, metrics, status, recovered = _training_batch(
                     model, optimizer, corrupted, raw, masked, joints, history, batch["indicator"],
-                    config, policy, epoch, step, diagnostic_dir)
+                    config, policy, epoch, step, diagnostic_dir, surface_points=surfaces)
                 _record_update(counts, status, recovered)
             else:
                 prediction, loss, metrics = _batch_forward(
-                    model, corrupted, raw, masked, joints, history, config, policy)
+                    model, corrupted, raw, masked, joints, history, config, policy,
+                    surface_points=surfaces)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite completion validation loss at step {step}")
         next_step = step + 1
@@ -440,6 +503,8 @@ def run_grouped_epoch(model, batches, config, device, epoch, optimizer=None, max
             break
         raw = batch["rt"].to(device, non_blocking=True)
         joints = batch["joints"].to(device, non_blocking=True)
+        surfaces = (batch["surface_points"].to(device, non_blocking=True)
+                    if "surface_points" in batch else None)
         history = batch["history_valid"].to(device, non_blocking=True)
         teacher = _batch_teacher(batch, raw, joints, history, model, config)
         for group in groups:
@@ -457,11 +522,12 @@ def run_grouped_epoch(model, batches, config, device, epoch, optimizer=None, max
                 if training:
                     prediction, loss, metrics, status, recovered = _training_batch(
                         model, optimizer, corrupted, raw, masked, joints, history, batch["indicator"],
-                        config, policy, epoch, step, diagnostic_dir, teacher)
+                        config, policy, epoch, step, diagnostic_dir, teacher, surfaces)
                     _record_update(counts, status, recovered)
                 else:
                     prediction, loss, metrics = _batch_forward(
-                        model, corrupted, raw, masked, joints, history, config, policy, teacher)
+                        model, corrupted, raw, masked, joints, history, config, policy,
+                        teacher, surfaces)
                     if not torch.isfinite(loss):
                         raise FloatingPointError(f"Non-finite {group} validation loss at step {step}")
             if not training or status["updated"]:
@@ -498,6 +564,8 @@ def run_grouped_epoch(model, batches, config, device, epoch, optimizer=None, max
     # Each nonempty group has equal influence; dense groups cannot dominate.
     result = {key: sum(report[key] for report in eligible) / len(eligible)
               for key in ("masked_mae_log", "joint_mpjpe_m", "loss")}
+    if all("surface_mpe_m" in report for report in eligible):
+        result["surface_mpe_m"] = sum(report["surface_mpe_m"] for report in eligible) / len(eligible)
     result.update(groups=reports, selection_aggregation="macro_over_nonempty_mask_groups",
                   evaluated_groups=len(reports), eligible_groups=len(eligible))
     return result
@@ -518,9 +586,18 @@ def train(args):
     seed_everything(config["train"]["seed"])
     device = choose_device(args.device)
     identity = source_identity(config["data"]["cache_path"])
-    datasets = {split: RTSequenceDataset(config["data"], split, args.labels,
-                                         args.limit_train if split == "train" else args.limit_val)
-                for split in ("train", "val")}
+    surface = config["model"].get("surface_prior", {})
+    surface_count = int(surface.get("num_points", 0)) if surface.get("enabled", False) else 0
+    fractions = {"train": getattr(args, "train_fraction", None),
+                 "val": getattr(args, "val_fraction", None)}
+    limits = {"train": args.limit_train, "val": args.limit_val}
+    datasets = {
+        split: RTSequenceDataset(
+            config["data"], split, args.labels, limits[split], fraction=fractions[split],
+            sampling_seed=config["train"]["seed"] + (0 if split == "train" else 100000),
+            surface_points=surface_count)
+        for split in ("train", "val")
+    }
     datasets = {split: _with_teacher_cache(dataset, args, config) for split, dataset in datasets.items()}
     label_signature = read_json(Path(args.labels) / "manifest.json")["signature"]
     model = RTCompletionNet(config["data"], config["model"]).to(device)
@@ -531,6 +608,8 @@ def train(args):
     best, first_epoch = float("inf"), 0
     resume_training_state = None
     debug_limits = {"train": args.limit_train, "val": args.limit_val, "steps": args.max_steps}
+    if any(value is not None for value in fractions.values()):
+        debug_limits.update(train_fraction=fractions["train"], val_fraction=fractions["val"])
     if any(value is not None for value in debug_limits.values()):
         print("WARNING: debug limits enabled; this run is not a full-data training result", flush=True)
     if args.resume:
@@ -625,7 +704,10 @@ def train(args):
                 if split == "train":
                     resume_training_state = None
             # Select on validation only, never on test labels or downstream test MPJPE.
-            score = metrics["val"]["masked_mae_log"] + config["train"]["selection_joint_weight"] * metrics["val"]["joint_mpjpe_m"]
+            score = (metrics["val"]["masked_mae_log"]
+                     + config["train"]["selection_joint_weight"] * metrics["val"]["joint_mpjpe_m"]
+                     + config["train"].get("selection_surface_weight", 0.)
+                     * metrics["val"].get("surface_mpe_m", 0.))
             improved = score < best
             best = min(score, best)
             payload = payload_for(epoch, metrics, complete=True)
@@ -645,10 +727,12 @@ def train(args):
                 console = {key: report[key] for key in ("epoch", "total_epochs", "seconds", "selection_score")}
                 console["train"] = {key: metrics["train"].get(key)
                                     for key in ("loss", "masked_mae_log", "joint_mpjpe_m",
-                                                "temporal_confidence", "history_null", "mask_mix",
+                                                "surface_mpe_m", "temporal_confidence", "history_null", "mask_mix",
                                                 "successful_updates", "skipped_batches", "recovered_batches")}
                 console["val"] = {key: metrics["val"][key]
                                   for key in ("masked_mae_log", "joint_mpjpe_m")}
+                if "surface_mpe_m" in metrics["val"]:
+                    console["val"]["surface_mpe_m"] = metrics["val"]["surface_mpe_m"]
                 console["val"]["groups"] = {
                     name: {key: values.get(key) for key in
                            ("masked_mae_log", "eligible_frame_fraction", "masked_coverage68",
@@ -703,11 +787,14 @@ def evaluate(args):
     if identity != checkpoint["source"]:
         raise ValueError("Checkpoint radar source/protocol changed")
     groups = getattr(args, "groups", None) or config.get("validation", {}).get("groups", list(MASK_GROUPS))
-    if len(set(groups)) != len(groups) or any(group not in MASK_GROUPS for group in groups):
+    if len(set(groups)) != len(groups) or any(group not in ALL_MASK_GROUPS for group in groups):
         raise ValueError("Evaluation groups must be distinct supported mask groups")
     config["validation"] = {"groups": groups, "seed": config.get("validation", {}).get(
         "seed", config["train"]["seed"] + 100000)}
-    dataset = RTSequenceDataset(config["data"], "val", args.labels, getattr(args, "limit", None))
+    surface = config["model"].get("surface_prior", {})
+    surface_count = int(surface.get("num_points", 0)) if surface.get("enabled", False) else 0
+    dataset = RTSequenceDataset(config["data"], "val", args.labels,
+                                getattr(args, "limit", None), surface_points=surface_count)
     dataset = _with_teacher_cache(dataset, args, config)
     signature = read_json(Path(args.labels) / "manifest.json")["signature"]
     if signature != checkpoint["label_signature"]:
@@ -732,6 +819,36 @@ def evaluate(args):
     atomic_json(output, report)
     print(f"Fixed-mask validation report: {output}", flush=True)
     return report
+
+
+def visualize(args):
+    """Lazy import keeps matplotlib out of training/export processes."""
+    from .visualization import generate_visualizations
+    return generate_visualizations(args)
+
+
+def visualize_teacher(args):
+    """Read-only visualization of the cached training-only temporal teacher."""
+    from .visualization import generate_teacher_visualizations
+    return generate_teacher_visualizations(args)
+
+
+def visualize_completion(args):
+    """RT-only before/after visualization matching deployment inference."""
+    from .visualization import generate_completion_visualizations
+    return generate_completion_visualizations(args)
+
+
+def prune_cache(args):
+    """Lazy import keeps the export/training path independent of cache tooling."""
+    from .cache_variants import prune_cache as run
+    return run(args)
+
+
+def evaluate_mesh_val(args):
+    """Frozen downstream validation probe; this command never reads test data."""
+    from .mesh_validation import evaluate_mesh_val as run
+    return run(args)
 
 
 def export(args):

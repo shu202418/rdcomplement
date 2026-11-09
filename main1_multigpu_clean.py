@@ -82,6 +82,9 @@ def load_config(path: str = "config.yaml") -> dict:
         "trans_weight":       lw["trans"],
         "vertices_weight":    lw["vertices"],
         "gender_weight":      lw["gender"],
+        "joints_weight":      lw.get("joints", 0.0),
+        "skeleton_weight":    lw.get("skeleton", 0.0),
+        "velocity_weight":    lw.get("velocity", 0.0),
         # eval
         "test_mode":          raw["eval"]["test_mode"],
         "test_model_path":    raw["eval"]["test_model_path"],
@@ -127,6 +130,21 @@ def set_reproducibility(seed: int, deterministic: bool = True):
 def unwrap_model(m):
     """Return the underlying module whether or not it is wrapped in DDP/DataParallel."""
     return m.module if isinstance(m, (nn.DataParallel, DDP)) else m
+
+
+def load_model_state(model, state_dict, allow_kinematic_init=False):
+    """Load current or legacy RT-Mesh weights with narrowly scoped compatibility."""
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = ("fpn.attention_pos", "fpn_m.attention_pos")
+    if allow_kinematic_init:
+        allowed_missing = allowed_missing + ("kinematic_head.",)
+    bad_missing = [k for k in incompatible.missing_keys if not k.startswith(allowed_missing)]
+    if bad_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible: "
+            f"missing={bad_missing}, unexpected={incompatible.unexpected_keys}"
+        )
+    return incompatible
 
 
 # ===========================================================================
@@ -181,7 +199,10 @@ def run_epoch(
     model.train() if is_train else model.eval()
 
     losses = []
-    loss_dict_sum = {k: 0 for k in ("betas", "pose_body", "root_orient", "trans", "vertices")}
+    loss_dict_sum = {k: 0 for k in (
+        "betas", "pose_body", "root_orient", "trans", "vertices",
+        "joints", "skeleton", "velocity",
+    )}
     avg_gradient_norm = 0.0
     progress_bar = tqdm(dataloader, desc="Training" if is_train else "Validation")
 
@@ -195,13 +216,22 @@ def run_epoch(
             gt_root_orient = gt["root_orient"].cuda()
             gt_trans      = gt["trans"].cuda()
             gt_genders    = gt["gender"].cuda()
-            gt_joint_root = batch["joints_root"][:, 0].cuda()
+            gt_joints     = batch["joints_root"].cuda()
+            gt_joint_root = gt_joints[:, 0]
+            gt_temporal_trans = batch.get("temporal_trans")
+            if gt_temporal_trans is not None:
+                gt_temporal_trans = gt_temporal_trans.cuda()
 
             if is_train:
                 optimizer.zero_grad()
 
             pred_betas, pred_pose_body, pred_root_orient, pred_trans, gender_pred, center_pred = \
                 model(radar_input)
+            core_model = unwrap_model(model)
+            if hasattr(core_model, "pop_auxiliary_outputs"):
+                auxiliary = core_model.pop_auxiliary_outputs()
+            else:
+                auxiliary = getattr(core_model, "auxiliary_outputs", None)
 
             # Vertex-level loss is disabled; GT/pred vertices kept as None
             pred_vertices, gt_vertices = None, None
@@ -212,6 +242,8 @@ def run_epoch(
                 gender_pred, gt_genders, gt_joint_root,
                 criterion1, criterion2, gender_criterion,
                 unwrap_model(model), pred_center=center_pred,
+                auxiliary=auxiliary, gt_joints=gt_joints,
+                gt_temporal_trans=gt_temporal_trans,
             )
             losses.append(loss.item())
 
@@ -234,10 +266,15 @@ def run_epoch(
 
                 optimizer.step()
 
-            for key in loss_dict_sum:
-                loss_dict_sum[key] += loss_components[key].item()
+            for key, value in loss_components.items():
+                if key in loss_dict_sum:
+                    loss_dict_sum[key] += value.item()
 
-            avg_loss_dict = {k: f"{loss_dict_sum[k] / len(losses):.4f}" for k in loss_dict_sum}
+            active_keys = loss_components.keys()
+            avg_loss_dict = {
+                k: f"{loss_dict_sum[k] / len(losses):.4f}"
+                for k in active_keys if k in loss_dict_sum
+            }
             progress_bar.set_postfix(loss=loss.item(), **avg_loss_dict)
 
     torch.cuda.empty_cache()
@@ -259,6 +296,7 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
         load_save=load_save, main_modality=config["modality"],
         scale_id=config["scale"], split_id=config["split"],
         rt_completion_cache=config.get("rt_completion_cache"),
+        return_temporal_labels=config["model"] == "RT-Mesh-Kinematic",
     )
     val_dataset = RF3DPoseDataset(
         [], cache_dir=config["cached_root"], split="val",
@@ -266,6 +304,7 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
         load_save=load_save, main_modality=config["modality"],
         scale_id=config["scale"], split_id=config["split"],
         rt_completion_cache=config.get("rt_completion_cache"),
+        return_temporal_labels=config["model"] == "RT-Mesh-Kinematic",
     )
     test_dataset = RF3DPoseDataset(
         [], cache_dir=config["cached_root"], split="test",
@@ -273,6 +312,7 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
         load_save=load_save, main_modality=config["modality"],
         scale_id=config["scale"], split_id=config["split"],
         rt_completion_cache=config.get("rt_completion_cache"),
+        return_temporal_labels=False,
     )
 
     # --- DataLoaders with DistributedSampler ---
@@ -302,8 +342,11 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
             dim=1024, depth=10, heads=8, dim_head=256,
             mlp_dim=2048, num_classes=17 * 3, dropout1=0.0, dropout2=0.0,
         ).cuda()
-    elif config["modality"] == "rawImage_XYZ" and config["model"] == "RT-Mesh":
-        model = Simple3DConvModelWithTripleCNNFPNAndAttention(config["smplx_paths"]).cuda()
+    elif config["modality"] == "rawImage_XYZ" and config["model"] in ("RT-Mesh", "RT-Mesh-Kinematic"):
+        model = Simple3DConvModelWithTripleCNNFPNAndAttention(
+            config["smplx_paths"],
+            kinematic_refinement=config["model"] == "RT-Mesh-Kinematic",
+        ).cuda()
     elif config["modality"] == "rawImage_XYZ" and config["model"] == "RETR":
         model = RETR(
             smplx_model_paths=config["smplx_paths"], task="SEG",
@@ -328,15 +371,31 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
                 config["resume_path"], map_location="cpu", weights_only=True
             )
             if isinstance(loaded, dict) and "model_state_dict" in loaded:
-                model.load_state_dict(loaded["model_state_dict"])
-                resume_checkpoint = loaded
-                start_epoch = int(loaded["epoch"]) + 1
-                logger.info(
-                    f"Loaded full checkpoint {config['resume_path']}; "
-                    f"resuming at epoch {start_epoch + 1}."
+                incompatible = load_model_state(
+                    model, loaded["model_state_dict"],
+                    allow_kinematic_init=config["model"] == "RT-Mesh-Kinematic",
                 )
+                if incompatible.missing_keys:
+                    # Optimizer parameter groups from a legacy checkpoint do
+                    # not contain newly registered position/kinematic weights.
+                    start_epoch = config["resume_start_epoch"]
+                    logger.info(
+                        f"Warm-started legacy checkpoint {config['resume_path']}; "
+                        f"initialized {len(incompatible.missing_keys)} new tensors and "
+                        "started a fresh optimizer."
+                    )
+                else:
+                    resume_checkpoint = loaded
+                    start_epoch = int(loaded["epoch"]) + 1
+                    logger.info(
+                        f"Loaded full checkpoint {config['resume_path']}; "
+                        f"resuming at epoch {start_epoch + 1}."
+                    )
             else:
-                model.load_state_dict(loaded)
+                load_model_state(
+                    model, loaded,
+                    allow_kinematic_init=config["model"] == "RT-Mesh-Kinematic",
+                )
                 start_epoch = config["resume_start_epoch"]
                 logger.info(
                     f"Warm-started from model-only checkpoint {config['resume_path']}; "
@@ -362,6 +421,9 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
             "trans":       config["trans_weight"],
             "vertices":    config["vertices_weight"],
             "gender":      config["gender_weight"],
+            "joints":      config["joints_weight"],
+            "skeleton":    config["skeleton_weight"],
+            "velocity":    config["velocity_weight"],
         }
 
         # Separate weight-decay and no-decay param groups (bias / norm layers)
@@ -551,7 +613,10 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
                 config["test_model_path"], map_location="cpu", weights_only=True
             )
             state_dict = loaded.get("model_state_dict", loaded) if isinstance(loaded, dict) else loaded
-            model.load_state_dict(state_dict)
+            load_model_state(
+                model, state_dict,
+                allow_kinematic_init=config["model"] == "RT-Mesh-Kinematic",
+            )
 
         model = DDP(
             model,
@@ -567,6 +632,9 @@ def final_training(config: dict, exp_path: str, logger: logging.Logger):
             "trans":       config["trans_weight"],
             "vertices":    config["vertices_weight"],
             "gender":      config["gender_weight"],
+            "joints":      config["joints_weight"],
+            "skeleton":    config["skeleton_weight"],
+            "velocity":    config["velocity_weight"],
         }
 
         result_path = os.path.join(exp_path, "test_epoch")

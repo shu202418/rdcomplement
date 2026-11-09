@@ -32,9 +32,9 @@ class ConvGRU3D(nn.Module):
 
 
 class GatedGeometry(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, geometry_channels=15):
         super().__init__()
-        self.project = nn.Conv3d(15, channels, 1)
+        self.project = nn.Conv3d(geometry_channels, channels, 1)
         self.gate = nn.Conv3d(2 * channels, channels, 1)
 
     def forward(self, features, capsules):

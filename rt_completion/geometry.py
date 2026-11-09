@@ -8,6 +8,11 @@ import torch.nn.functional as F
 CAPSULES = ((0, 9), (9, 12), (12, 15), (9, 16), (9, 17),
             (16, 18), (18, 20), (17, 19), (19, 21),
             (1, 4), (4, 7), (2, 5), (5, 8), (7, 10), (8, 11))
+# A third joint fixes rotation around each capsule axis.  These references are
+# deliberately anatomical neighbours rather than arbitrary world axes.  When
+# a reference is degenerate, ``_part_frame`` falls back deterministically.
+CAPSULE_REFERENCES = (1, 16, 16, 12, 12, 9, 16, 9, 17,
+                      0, 1, 0, 2, 4, 5)
 RADIUS_MULTIPLIERS = (1.8, 0.8, 1.1, 0.9, 0.9, 0.8, 0.65, 0.8, 0.65,
                       1.0, 0.8, 1.0, 0.8, 0.7, 0.7)
 
@@ -31,6 +36,21 @@ def capsule_heatmaps(joints, shape, bounds, radius=0.16):
         distance_sq = (grid - a - projection * vector).square().sum(-1)
         heatmaps.append(torch.exp(-distance_sq / (2 * (radius * multiplier)**2)))
     return torch.stack(heatmaps, 1).reshape(joints.shape[0], len(CAPSULES), *shape)
+
+
+def surface_heatmap(points, shape, bounds, radius=0.12):
+    """Aggregate Gaussian proximity to sparse, topology-consistent surface points."""
+    if points.ndim != 3 or points.shape[-1] != 3 or radius <= 0:
+        raise ValueError("expected surface points B,K,3 and positive radius")
+    grid = metric_grid(shape, bounds, points.device).reshape(1, -1, 3)
+    # K is intentionally small (normally 64).  Chunking avoids allocating a
+    # B x all-voxels x K tensor at full resolution.
+    best = torch.full((points.shape[0], grid.shape[1]), float("inf"),
+                      dtype=torch.float32, device=points.device)
+    for start in range(0, points.shape[1], 16):
+        distance = (grid[:, :, None] - points[:, None, start:start + 16].float()).square().sum(-1)
+        best = torch.minimum(best, distance.amin(-1))
+    return torch.exp(-best / (2 * radius ** 2)).reshape(points.shape[0], 1, *shape)
 
 
 def warp_by_root(volume, previous_root, current_root, bounds):
@@ -116,9 +136,28 @@ def _rotate_between_axes(offset, source_axis, destination_axis):
     return torch.where(cosine < -.9999, flipped, rotated)
 
 
+def _part_frame(joints, start, end, reference):
+    """Right-handed local frame with the bone as its first axis."""
+    axis = joints[:, end] - joints[:, start]
+    length = axis.norm(dim=-1, keepdim=True)
+    first = axis / length.clamp_min(1e-8)
+    hint = joints[:, reference] - joints[:, start]
+    second = hint - (hint * first).sum(-1, keepdim=True) * first
+    # The anatomical hint can be collinear for a straight pose.  Select the
+    # least-aligned Cartesian basis without introducing random discontinuity.
+    basis = F.one_hot(first.abs().argmin(-1), num_classes=3).float()
+    fallback = basis - (basis * first).sum(-1, keepdim=True) * first
+    second_norm = second.norm(dim=-1, keepdim=True)
+    second = torch.where(second_norm > 1e-5, second, fallback)
+    second = F.normalize(second, dim=-1, eps=1e-8)
+    third = F.normalize(torch.cross(first, second, dim=-1), dim=-1, eps=1e-8)
+    second = torch.cross(third, first, dim=-1)
+    return torch.stack((first, second, third), dim=-1), length
+
+
 def articulated_warp(volume, source_joints, target_joints, bounds, radius=0.16,
                      source_support=None, joint_variance=None, body_threshold=0.25,
-                     source_body_mask=None):
+                     source_body_mask=None, use_part_frames=False):
     """Inverse-warp a source volume using 15 approximately rigid body parts.
 
     Each target voxel selects its nearest *normalized* target capsule. Its
@@ -153,7 +192,7 @@ def articulated_warp(volume, source_joints, target_joints, bounds, radius=0.16,
         selected_quality = torch.zeros_like(best)
         selected_valid = torch.zeros_like(best, dtype=torch.bool)
         variance = _joint_variance_scalar(joint_variance, batch)
-        for (start, end), multiplier in zip(CAPSULES, RADIUS_MULTIPLIERS):
+        for part, ((start, end), multiplier) in enumerate(zip(CAPSULES, RADIUS_MULTIPLIERS)):
             a_t, a_s = target[:, start:start + 1], source[:, start:start + 1]
             bone_t = target[:, end:end + 1] - a_t
             bone_s = source[:, end:end + 1] - a_s
@@ -170,9 +209,18 @@ def articulated_warp(volume, source_joints, target_joints, bounds, radius=0.16,
             distance = (offset - projection * bone_t).square().sum(-1)
             normalized_distance = distance / (radius * multiplier)**2
             better = (normalized_distance < best) & valid_bone
-            radial = offset - longitudinal * axis_t
-            mapped = (a_s + _rotate_between_axes(radial, axis_t, axis_s)
-                      + longitudinal * ratio * axis_s)
+            if use_part_frames:
+                source_frame, _ = _part_frame(source, start, end, CAPSULE_REFERENCES[part])
+                target_frame, _ = _part_frame(target, start, end, CAPSULE_REFERENCES[part])
+                # Inverse warp: target-local coordinates are interpreted in
+                # the corresponding source frame.  No bone-length scaling is
+                # applied, hence this branch is a genuine local rigid motion.
+                local = torch.einsum("bij,bnj->bni", target_frame.transpose(1, 2), offset)
+                mapped = a_s + torch.einsum("bij,bnj->bni", source_frame, local)
+            else:
+                radial = offset - longitudinal * axis_t
+                mapped = (a_s + _rotate_between_axes(radial, axis_t, axis_s)
+                          + longitudinal * ratio * axis_s)
             # Moderate length uncertainty reduces weight without imposing a
             # hard equality on bone lengths or suppressing genuine rotation.
             bone_quality = torch.exp(-ratio.clamp_min(1e-8).log().abs().squeeze(-1) / .5)
@@ -253,7 +301,8 @@ def temporal_target_v2(raw, joints, history_valid, bounds, radius, config):
         warped = articulated_warp(raw[:, time:time + 1].float() * observed,
                                   joints[:, time], joints[:, -1], bounds, radius,
                                   source_support=observed.float(), body_threshold=body_threshold,
-                                  source_body_mask=source_body)
+                                  source_body_mask=source_body,
+                                  use_part_frames=bool(config.get("temporal_part_frames", False)))
         usable = ((warped["support"] >= support_threshold) & warped["in_bounds"]
                   & history_valid[:, time, None, None, None, None].bool())
         # Divide sparse interpolated amplitude by interpolated observed support;

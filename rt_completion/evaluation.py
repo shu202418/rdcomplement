@@ -6,11 +6,8 @@ import math
 import numpy as np
 import torch
 
-from .losses import corrupt_rt
+from .losses import ALL_MASK_GROUPS, MASK_GROUPS, corrupt_rt
 from .selection import select_additions
-
-
-MASK_GROUPS = ("random", "single_part", "continuous_part", "spatial_block")
 
 
 def mask_seed(indicator, seed, group):
@@ -20,7 +17,7 @@ def mask_seed(indicator, seed, group):
 
 def fixed_corruption(raw, joints, indicators, mask_config, bounds, seed, group):
     """Masks are independent of epoch, shuffle, batch size and worker count."""
-    if group not in MASK_GROUPS:
+    if group not in ALL_MASK_GROUPS:
         raise ValueError(f"Unknown fixed mask group: {group}")
     settings = dict(mask_config, mode="mixed_parts", radius_jitter=0., joint_jitter_m=0.)
     corrupted, masked, infos = [], [], []

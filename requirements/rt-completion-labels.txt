@@ -1,0 +1,4 @@
+# Optional: additionally needed to regenerate SMPL-X joint labels.
+-r rt-completion.txt
+scipy==1.15.3
+smplx==0.1.28

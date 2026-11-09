@@ -1,0 +1,104 @@
+# S1 V3: part-rigid temporal alignment, natural-missing masks and SMPL-X
+# surface-anchor supervision.  SMPL-X is used only to build train/val labels;
+# export/inference remains RT-only.
+data:
+  cache_path: MR-Mesh/rf3dpose_all
+  scale: p1
+  protocol: s1
+  shape: [121, 111, 31]
+  bounds: [[-3.0, 3.0], [0.5, 6.0], [0.0, 3.0]]
+  window: 4
+  intensity_scale: 1.0
+  intensity_cap: 10.0
+
+model:
+  architecture: reliability_v2
+  encoder: dense
+  base_channels: 8
+  capsule_radius_m: 0.16
+  feature_radius_scale: 1.0
+  feature_support_threshold: 0.01
+  joint_variance_floor: 0.0001
+  # Uses a third anatomical joint to resolve rotation around every bone axis.
+  part_rigid_frames: true
+  surface_prior:
+    enabled: true
+    num_points: 64
+    heatmap_radius_m: 0.12
+
+mask:
+  mode: mixed_parts
+  # Includes weak-return dropout and radar-centred range shadows in addition
+  # to motion-following body-part and ordinary spatial masks.
+  group_weights:
+    random: 0.20
+    weak_return: 0.15
+    single_part: 0.20
+    continuous_part: 0.20
+    spatial_block: 0.10
+    range_shadow: 0.15
+  drop_probability: 0.20
+  weak_quantile: 0.40
+  weak_temperature: 0.05
+  weak_drop_probability: 0.65
+  block_shape: [15, 15, 9]
+  part_radius: 0.16
+  radius_jitter: 0.15
+  joint_jitter_m: 0.015
+  continuous_min_frames: 2
+  continuous_max_frames: 4
+  shadow_min_frames: 1
+  shadow_max_frames: 3
+  shadow_azimuth_width_rad: 0.12
+  shadow_height_m: 0.45
+  shadow_start_scale: 0.95
+
+loss:
+  observed_weight: 0.05
+  reflection_weight: 1.0
+  temporal_weight: 0.10
+  temporal_alignment: articulated
+  temporal_part_frames: true
+  temporal_min_support: 2
+  temporal_support_threshold: 0.25
+  temporal_body_threshold: 0.25
+  temporal_consistency_scale: 0.35
+  temporal_alignment_scale: 0.5
+  temporal_min_intensity: 0.000001
+  joint_weight: 1.0
+  joint_uncertainty_weight: 0.01
+  surface_weight: 1.0
+  quality_weight: 0.05
+  quality_error_scale: 0.15
+  sparsity_weight: 0.03
+
+validation:
+  groups: [random, weak_return, single_part, continuous_part, spatial_block, range_shadow]
+  seed: 100042
+
+train:
+  seed: 42
+  epochs: 20
+  batch_size: 32
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  amp: true
+  amp_dtype: auto
+  retry_fp32: true
+  checkpoint_every_steps: 1000
+  max_nonfinite_batches: 20
+  max_consecutive_nonfinite: 3
+  max_failure_snapshots: 3
+  log_every: 50
+  detailed_metrics_every: 0
+  selection_joint_weight: 0.1
+  selection_surface_weight: 0.05
+
+export:
+  probability_threshold: 0.8
+  body_threshold: 0.25
+  max_sigma_log: 0.3
+  min_intensity: 0.02
+  max_added_voxels: 512
+  map_size_gb: 8

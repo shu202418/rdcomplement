@@ -39,6 +39,9 @@ def _legacy_corrupt_rt(raw, config, generator):
 
 
 MASK_GROUPS = ("random", "single_part", "continuous_part", "spatial_block")
+NATURAL_MASK_GROUPS = ("weak_return", "range_shadow")
+ALL_MASK_GROUPS = ("random", "weak_return", "single_part", "continuous_part",
+                   "spatial_block", "range_shadow")
 
 
 def _metric_points(indices, shape, bounds):
@@ -80,7 +83,7 @@ def corrupt_rt(raw, config, generator, *, joints=None, bounds=None, group=None, 
                 "duration": torch.full((batch,), raw.shape[1], device=raw.device, dtype=torch.long),
                 "eligible": masked.flatten(1).any(1)}
         return corrupted, masked, info
-    if group is not None and group not in MASK_GROUPS:
+    if group is not None and group not in ALL_MASK_GROUPS:
         raise ValueError(f"Unknown RT mask group: {group}")
     if raw.ndim != 5:
         raise ValueError("RT must have shape [B,T,X,Y,Z]")
@@ -92,14 +95,14 @@ def corrupt_rt(raw, config, generator, *, joints=None, bounds=None, group=None, 
             "duration": torch.zeros(batch_size, device=raw.device, dtype=torch.long)}
     weights = config.get("group_weights", {"random": .35, "single_part": .3,
                                           "continuous_part": .25, "spatial_block": .1})
-    probabilities = raw.new_tensor([float(weights.get(name, 0.)) for name in MASK_GROUPS])
+    probabilities = raw.new_tensor([float(weights.get(name, 0.)) for name in ALL_MASK_GROUPS])
     if group is None and (not torch.isfinite(probabilities).all() or
                           (probabilities < 0).any() or probabilities.sum() <= 0):
         raise ValueError("mask.group_weights must be finite, nonnegative, and have positive total")
     if joints is not None and joints.shape != (batch_size, frames, 22, 3):
         raise ValueError("Mask joints must have shape [B,T,22,3]")
     for batch in range(batch_size):
-        kind = group or MASK_GROUPS[int(torch.multinomial(probabilities, 1, generator=generator))]
+        kind = group or ALL_MASK_GROUPS[int(torch.multinomial(probabilities, 1, generator=generator))]
         info["kind"].append(kind)
         coords = observed[batch].nonzero()
         if kind == "random":
@@ -111,6 +114,25 @@ def corrupt_rt(raw, config, generator, *, joints=None, bounds=None, group=None, 
             if len(chosen):
                 corrupted[batch, -1, chosen[:, 0], chosen[:, 1], chosen[:, 2]] = 0
             info["duration"][batch] = 1
+        elif kind == "weak_return":
+            info["duration"][batch] = 1
+            if not len(coords):
+                continue
+            values = raw[batch, -1, coords[:, 0], coords[:, 1], coords[:, 2]].float()
+            quantile = float(config.get("weak_quantile", .4))
+            if not 0 < quantile <= 1:
+                raise ValueError("weak_quantile must lie in (0,1]")
+            boundary = torch.quantile(values, quantile)
+            temperature = max(float(config.get("weak_temperature", .05)), 1e-6)
+            propensity = torch.sigmoid((boundary - values) / temperature)
+            probability = float(config.get("weak_drop_probability", .65))
+            if not 0 <= probability <= 1:
+                raise ValueError("weak_drop_probability must lie in [0,1]")
+            selected = torch.rand(len(coords), device=raw.device, generator=generator) < propensity * probability
+            if probability > 0 and not selected.any():
+                selected[values.argmin()] = True
+            chosen = coords[selected]
+            corrupted[batch, -1, chosen[:, 0], chosen[:, 1], chosen[:, 2]] = 0
         elif kind == "spatial_block":
             info["duration"][batch] = frames
             if not len(coords):
@@ -119,6 +141,35 @@ def corrupt_rt(raw, config, generator, *, joints=None, bounds=None, group=None, 
             slices = tuple(slice(max(0, c - n // 2), min(s, c + (n + 1) // 2))
                            for c, n, s in zip(centre, config.get("block_shape", [15, 15, 9]), raw.shape[-3:]))
             corrupted[(batch, slice(None), *slices)] = 0
+        elif kind == "range_shadow":
+            if bounds is None:
+                raise ValueError("Range-shadow masks require metric radar bounds")
+            if not len(coords):
+                continue
+            centre_index = int(torch.randint(len(coords), (), device=raw.device, generator=generator))
+            centre = _metric_points(coords[centre_index:centre_index + 1], raw.shape[-3:], bounds)[0]
+            centre_angle = torch.atan2(centre[0], centre[1])
+            centre_range = torch.linalg.vector_norm(centre[:2])
+            minimum = min(frames, max(1, int(config.get("shadow_min_frames", 1))))
+            maximum = min(frames, max(minimum, int(config.get("shadow_max_frames", frames))))
+            duration = int(torch.randint(minimum, maximum + 1, (), device=raw.device, generator=generator))
+            info["duration"][batch] = duration
+            half_angle = float(config.get("shadow_azimuth_width_rad", .12)) / 2
+            height = float(config.get("shadow_height_m", .45))
+            start_range = centre_range * float(config.get("shadow_start_scale", .95))
+            for time in range(frames - duration, frames):
+                indices = (raw[batch, time] > 0).nonzero()
+                if not len(indices):
+                    continue
+                points = _metric_points(indices, raw.shape[-3:], bounds)
+                angles = torch.atan2(points[:, 0], points[:, 1])
+                difference = torch.atan2(torch.sin(angles - centre_angle),
+                                         torch.cos(angles - centre_angle)).abs()
+                ranges = torch.linalg.vector_norm(points[:, :2], dim=-1)
+                selected = ((difference <= half_angle) & (ranges >= start_range)
+                            & ((points[:, 2] - centre[2]).abs() <= height / 2))
+                chosen = indices[selected]
+                corrupted[batch, time, chosen[:, 0], chosen[:, 1], chosen[:, 2]] = 0
         else:
             if joints is None or bounds is None:
                 raise ValueError("Part masks require radar-coordinate joints and metric bounds")
@@ -219,7 +270,20 @@ def _joint_objectives(prediction, variance, labels, valid_frames, variance_floor
     return smooth, nll
 
 
-def completion_loss(output, raw, masked, joints, history_valid, model, config, *, temporal_teacher=None):
+def _surface_objective(prediction, labels, valid_frames):
+    if prediction.shape != labels.shape or prediction.ndim != 4 or prediction.shape[-1] != 3:
+        raise ValueError("Surface prediction/labels must have shape B,T,K,3")
+    valid = valid_frames[..., None] & torch.isfinite(labels).all(-1)
+    target = torch.nan_to_num(labels.detach())
+    weights = valid[..., None].expand_as(prediction).float()
+    loss = weighted_mean(
+        F.smooth_l1_loss(prediction.float(), target, beta=.03, reduction="none"), weights)
+    distance = weighted_mean((prediction.float() - target).norm(dim=-1), valid.float())
+    return loss, distance
+
+
+def completion_loss(output, raw, masked, joints, history_valid, model, config, *,
+                    temporal_teacher=None, surface_points=None):
     """V2 weak supervision; the original baseline remains byte-for-byte in its path."""
     use_v2 = config.get("temporal_alignment") == "articulated" or "joints_sequence" in output
     if not use_v2:
@@ -294,6 +358,25 @@ def completion_loss(output, raw, masked, joints, history_valid, model, config, *
     joint_loss = torch.stack(joint_terms).mean()
     joint_nll = torch.stack(joint_nll_terms).mean() if joint_nll_terms else zero
 
+    surface_loss, surface_mpe = zero, zero.detach()
+    if "surface_points" in output or surface_points is not None:
+        if surface_points is None or "surface_points" not in output:
+            raise ValueError("Surface-enabled models require matching SMPL-X surface labels")
+        if surface_points.ndim != 4 or surface_points.shape[:2] != joints.shape[:2]:
+            raise ValueError("Surface labels must have shape B,T,K,3")
+        terms, distances = [], []
+        current_surface_loss, current_surface_mpe = _surface_objective(
+            output["surface_points"][:, None], surface_points[:, -1:], valid_frames[:, -1:])
+        terms.append(current_surface_loss)
+        distances.append(current_surface_mpe)
+        if "surface_sequence" in output:
+            sequence_loss, sequence_mpe = _surface_objective(
+                output["surface_sequence"], surface_points, valid_frames)
+            terms.append(sequence_loss)
+            distances.append(sequence_mpe)
+        surface_loss = torch.stack(terms).mean()
+        surface_mpe = torch.stack(distances).mean().detach()
+
     # Independently supervise historical quality with artificially held-out
     # current measurements, not by multiplying the task loss by learned trust.
     # These are coarse conditional-mean proxy labels, not physical SNR labels.
@@ -318,6 +401,7 @@ def completion_loss(output, raw, masked, joints, history_valid, model, config, *
              + config.get("temporal_weight", .1) * temporal
              + config.get("joint_weight", 1.) * joint_loss
              + config.get("joint_uncertainty_weight", .01) * joint_nll
+             + config.get("surface_weight", 0.) * surface_loss
              + config.get("sparsity_weight", .03) * sparsity
              + config.get("quality_weight", .05) * quality_loss)
     sigma = (.5 * logvar.detach()).exp()
@@ -331,6 +415,7 @@ def completion_loss(output, raw, masked, joints, history_valid, model, config, *
         "loss": total.detach(), "reconstruction_nll": reconstruction.detach(),
         "reflection": reflection.detach(), "temporal": temporal.detach(),
         "sparsity": sparsity.detach(), "joint_loss": joint_loss.detach(), "joint_nll": joint_nll.detach(),
+        "surface_loss": surface_loss.detach(), "surface_mpe_m": surface_mpe,
         "masked_mae_log": weighted_mean(error.abs(), masked_float).detach(),
         "joint_mpjpe_m": weighted_mean(joint_distance, finite_current.float()).detach(),
         "masked_voxels": masked.sum().detach(), "temporal_voxels": temporal_mask.sum().detach(),

@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from smplx import SMPLXLayer
 import numpy as np
 
+from .kinematic_refinement import KinematicRefinementHead
+
 
 def batch_rodrigues(theta):
     """
@@ -124,7 +126,7 @@ class FPN3DWithMultiHeadAttention(nn.Module):
         self.lateral_convs = nn.ModuleList()
         self.output_convs = nn.ModuleList()
         self.attention_modules = nn.ModuleList()
-        self.attention_pos = []
+        last_lateral_shape = None
 
         stride = (1,3,3) if stride_perform else (1,1,1)
 
@@ -134,11 +136,13 @@ class FPN3DWithMultiHeadAttention(nn.Module):
             output_stride = (0, 2-3*lateral_shape[1]+in_channels[2], 2-3*lateral_shape[2]+in_channels[3]) if stride_perform else (0, 0, 0)
             output_conv = nn.ConvTranspose3d(out_channels, out_channels, kernel_size=3, padding=1, stride=stride, output_padding=output_stride)
             attention_module = MultiHeadAttentionModule(out_channels, num_heads)
-            pos = nn.Parameter(torch.zeros(1, out_channels, lateral_shape[0], lateral_shape[1], lateral_shape[2])).cuda()
+            last_lateral_shape = lateral_shape
             self.lateral_convs.append(lateral_conv)
             self.output_convs.append(output_conv)
             self.attention_modules.append(attention_module)
-            self.attention_pos.append(pos)
+        self.attention_pos = nn.Parameter(torch.zeros(
+            1, out_channels, last_lateral_shape[0], last_lateral_shape[1], last_lateral_shape[2]
+        ))
 
     def forward(self, inputs):
         # laterals = [lateral_conv(x) for lateral_conv, x in zip(self.lateral_convs, inputs)]
@@ -148,16 +152,17 @@ class FPN3DWithMultiHeadAttention(nn.Module):
         #         upsampled = F.interpolate(laterals[i + 1], size=laterals[i].shape[2:], mode="trilinear", align_corners=False)
         #         laterals[i] += upsampled
         #     laterals[i] = self.attention_modules[i](laterals[i] + self.attention_pos[i])
-        laterals = self.lateral_convs[-1](inputs[-1]) + self.attention_pos[-1]
-        for i in range(len(inputs)):
-            laterals = self.attention_modules[i](laterals)
+        laterals = self.lateral_convs[-1](inputs[-1]) + self.attention_pos
+        for attention_module in self.attention_modules:
+            laterals = attention_module(laterals)
 
         laterals = self.output_convs[-1](laterals)
         return [laterals]
 
 # setting the final model for training
 class Simple3DConvModelWithTripleCNNFPNAndAttention(nn.Module):
-    def __init__(self, smplx_model_paths, input_channels=(4,121,111,31), fpn_out_channels=256, reduced_channels=256, dropout_rate=0.0):
+    def __init__(self, smplx_model_paths, input_channels=(4,121,111,31), fpn_out_channels=256,
+                 reduced_channels=256, dropout_rate=0.0, kinematic_refinement=False):
         super(Simple3DConvModelWithTripleCNNFPNAndAttention, self).__init__()
 
         '''Detection part of model'''
@@ -286,6 +291,9 @@ class Simple3DConvModelWithTripleCNNFPNAndAttention(nn.Module):
             'vertices': 0.001,
             'gender': 1.0
         }
+        self.kinematic_refinement = bool(kinematic_refinement)
+        self.kinematic_head = KinematicRefinementHead(dim) if self.kinematic_refinement else None
+        self.auxiliary_outputs = None
 
     def forward(self, in_tensor):
         # assert not (torch.isnan(in_tensor) | torch.isinf(in_tensor)).any(), "NaN or Inf in x before fc2_gender"
@@ -368,6 +376,12 @@ class Simple3DConvModelWithTripleCNNFPNAndAttention(nn.Module):
 
         pred_trans1 = pred_trans_norm1 * self.trans_scale + self.trans_offset
         pred_trans2 = pred_trans_norm2 * self.trans_scale + self.trans_offset
+
+        self.auxiliary_outputs = None
+        if self.kinematic_head is not None:
+            pred_pose_body, pred_root_orient, pred_trans2, self.auxiliary_outputs = self.kinematic_head(
+                x, in_tensor, pred_pose_body, pred_root_orient, pred_trans2
+            )
         
 
         
@@ -375,6 +389,12 @@ class Simple3DConvModelWithTripleCNNFPNAndAttention(nn.Module):
         
                 
         return pred_betas, pred_pose_body, pred_root_orient, pred_trans2, gender_pred, pred_trans1
+
+    def pop_auxiliary_outputs(self):
+        """Return and clear training-only outputs so their graph is not retained."""
+        auxiliary = self.auxiliary_outputs
+        self.auxiliary_outputs = None
+        return auxiliary
 
     def get_smplx_output(self, pred_betas, pred_pose_body, pred_root_orient, pred_trans, gender):
         vertices_list = []

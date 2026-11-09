@@ -58,6 +58,7 @@ class RF3DPoseDataset(Dataset):
         scale_id="p3",
         split_id="s2",
         rt_completion_cache=None,
+        return_temporal_labels=False,
     ):
         assert split in ["train", "val", "test"]
         self.transform = transform
@@ -65,6 +66,7 @@ class RF3DPoseDataset(Dataset):
         self.use_image = use_image
         self.radar_shape = radar_shape
         self.temporal_window = temporal_window
+        self.return_temporal_labels = bool(return_temporal_labels)
         self.cache_path = os.path.join(cache_dir, "rf3dpose_all")
         os.makedirs(self.cache_path, exist_ok=True)
 
@@ -214,6 +216,27 @@ class RF3DPoseDataset(Dataset):
             ]
         radar_image_selected = np.stack(radar_image_selected, axis=0)
 
+        # Translation history is cheap to load and provides direct supervision
+        # for the optional trajectory/velocity branch.  It deliberately avoids
+        # generating four extra SMPL-X meshes per sample.
+        temporal_trans = None
+        if self.return_temporal_labels:
+            temporal_trans = []
+            with self.lmdb_envs["params"].begin() as txn_param, \
+                    self.lmdb_envs["calib"].begin() as txn_calib:
+                for temporal_indicator in radar_indicators:
+                    key = str(temporal_indicator).encode()
+                    temporal_parameter = unpack_dict_np(txn_param.get(key))
+                    temporal_calibration = unpack_dict_np(txn_calib.get(key))
+                    temporal_parameter["gender"] = gender_info[f"P{temporal_indicator[0]}"]
+                    temporal_parameter_radar = calibrate_param_to_radar(
+                        temporal_parameter, temporal_calibration
+                    )
+                    if self.normalize_flag:
+                        temporal_parameter_radar["trans"][..., 2] -= 1.5
+                    temporal_trans.append(temporal_parameter_radar["trans"])
+            temporal_trans = np.stack(temporal_trans, axis=0).astype(np.float32)
+
         for i in range(len(radar_PC_selected)):
             if self.normalize_flag:
                 radar_PC_selected[i][..., 2] = radar_PC_selected[i][..., 2] - 1.5
@@ -245,6 +268,8 @@ class RF3DPoseDataset(Dataset):
             "radar_points": radar_PC_seq,
             "joints_root": joints_root,
         }
+        if temporal_trans is not None:
+            sample["temporal_trans"] = temporal_trans
 
         if self.use_image:
             sample["image"] = image

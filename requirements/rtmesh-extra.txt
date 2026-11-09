@@ -1,0 +1,13 @@
+# Optional: the original downstream main1_multigpu_clean.py entry point.
+# Install matching torchvision from the PyTorch CUDA index separately.
+# pointnet2_ops is a compiled extension: see the server setup document.
+-r rt-completion-labels.txt
+tqdm==4.67.1
+matplotlib==3.10.5
+pandas==2.3.3
+einops==0.8.1
+pymanopt==2.2.1
+opencv-python==4.12.0.88
+imageio==2.37.0
+Pillow==11.0.0
+trimesh==4.7.4

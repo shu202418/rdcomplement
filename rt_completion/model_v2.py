@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .geometry import articulated_warp, capsule_heatmaps, metric_grid
+from .geometry import articulated_warp, capsule_heatmaps, metric_grid, surface_heatmap
 from .model import ConvGRU3D, GatedGeometry, block
 
 
@@ -70,6 +70,13 @@ class ReliabilityRTCompletionNet(nn.Module):
         self.variance_floor = float(model.get("joint_variance_floor", 1e-4))
         self.support_threshold = float(model.get("feature_support_threshold", .01))
         self.feature_radius_scale = float(model.get("feature_radius_scale", 1.))
+        self.part_rigid_frames = bool(model.get("part_rigid_frames", False))
+        surface = model.get("surface_prior", {})
+        self.surface_enabled = bool(surface.get("enabled", False))
+        self.surface_points_count = int(surface.get("num_points", 0)) if self.surface_enabled else 0
+        self.surface_radius = float(surface.get("heatmap_radius_m", .12))
+        if self.surface_enabled and (self.surface_points_count < 4 or self.surface_radius <= 0):
+            raise ValueError("surface_prior requires num_points >= 4 and positive heatmap_radius_m")
         if self.feature_radius_scale < 0:
             raise ValueError("feature_radius_scale must be nonnegative")
         self.encoder1 = block(2, channels, stride=2)
@@ -77,13 +84,16 @@ class ReliabilityRTCompletionNet(nn.Module):
         self.encoder3 = block(channels * 2, channels * 4, stride=2)
         self.gru = ConvGRU3D(channels * 4)
         self.joint_logits = nn.Conv3d(channels * 4, 22, 1)
+        self.surface_logits = (nn.Conv3d(channels * 4, self.surface_points_count, 1)
+                               if self.surface_enabled else None)
         self.history1 = LocalHistoryFusion(channels)
         self.history2 = LocalHistoryFusion(channels * 2)
         self.history3 = LocalHistoryFusion(channels * 4)
         self.temporal_delta = nn.Conv3d(channels * 4, channels * 4, 1)
-        self.fuse3 = GatedGeometry(channels * 4)
-        self.fuse2 = GatedGeometry(channels * 2)
-        self.fuse1 = GatedGeometry(channels)
+        geometry_channels = 16 if self.surface_enabled else 15
+        self.fuse3 = GatedGeometry(channels * 4, geometry_channels)
+        self.fuse2 = GatedGeometry(channels * 2, geometry_channels)
+        self.fuse1 = GatedGeometry(channels, geometry_channels)
         self.decode2 = block(channels * 6, channels * 2)
         self.decode1 = block(channels * 3, channels)
         self.decode0 = block(channels + 2, channels)
@@ -107,6 +117,14 @@ class ReliabilityRTCompletionNet(nn.Module):
             mean = heat @ grid
             variance = (heat @ grid.square() - mean.square()).clamp_min(0) + self.variance_floor
         return mean, variance
+
+    def _surface_distribution(self, feature):
+        if self.surface_logits is None:
+            raise RuntimeError("surface prior is disabled")
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            heat = self.surface_logits(feature).float().flatten(2).softmax(-1)
+            grid = metric_grid(feature.shape[-3:], self.bounds, feature.device).reshape(-1, 3)
+            return heat @ grid
 
     def _feature_radius(self, shape):
         # A coarse voxel represents a finite spatial cell, not an infinitesimal
@@ -133,7 +151,7 @@ class ReliabilityRTCompletionNet(nn.Module):
         encoded = torch.stack((torch.log1p(raw.clamp(0, self.cap) / self.scale),
                                (raw != 0).to(raw.dtype)), dim=2)
         features, supports, intensities = [], [], []
-        joints, variances, temporal_joints, temporal_variances = [], [], [], []
+        joints, variances, temporal_joints, temporal_variances, surfaces = [], [], [], [], []
         hidden = None
         for time in range(times):
             first = self.encoder1(encoded[:, time])
@@ -166,6 +184,8 @@ class ReliabilityRTCompletionNet(nn.Module):
             mean, variance = self._joint_distribution(third)
             joints.append(mean)
             variances.append(variance)
+            if self.surface_enabled:
+                surfaces.append(self._surface_distribution(third))
             old_hidden = torch.zeros_like(third) if hidden is None else hidden
             candidate = self.gru(third, old_hidden)
             hidden = torch.where(valid_frames[:, time, None, None, None, None], candidate, old_hidden)
@@ -190,6 +210,7 @@ class ReliabilityRTCompletionNet(nn.Module):
                     self._feature_radius(current.shape[-3:]),
                     source_support=supports[time][scale],
                     joint_variance=torch.stack((variances[time], current_variance), 1),
+                    use_part_frames=self.part_rigid_frames,
                 )
                 warped_features.append(result["values"][:, :-2].to(current.dtype))
                 density = result["values"][:, -1:].clamp(0, 1)
@@ -236,11 +257,20 @@ class ReliabilityRTCompletionNet(nn.Module):
         temporal_capsules = capsule_heatmaps(trusted_joints, features[-1][1].shape[-3:],
                                              self.bounds, self.radius)
         capsule_scales = []
+        if self.surface_enabled:
+            current_surface = surfaces[-1]
+            surface_prior = surface_heatmap(current_surface, features[-1][1].shape[-3:],
+                                            self.bounds, self.surface_radius)
         for scale in range(3):
             size = features[-1][scale].shape[-3:]
             base = F.interpolate(current_capsules, size=size, mode="trilinear", align_corners=True)
             temporal = F.interpolate(temporal_capsules, size=size, mode="trilinear", align_corners=True)
-            capsule_scales.append(base + masses[scale] * (temporal - base))
+            geometry = base + masses[scale] * (temporal - base)
+            if self.surface_enabled:
+                surface_scale = F.interpolate(surface_prior, size=size, mode="trilinear",
+                                              align_corners=True)
+                geometry = torch.cat((geometry, surface_scale), 1)
+            capsule_scales.append(geometry)
         coarse = self.fuse3(fused[2], capsule_scales[2])
         up2 = F.interpolate(coarse, size=fused[1].shape[-3:], mode="trilinear", align_corners=True)
         up2 = self.decode2(torch.cat((up2, self.fuse2(fused[1], capsule_scales[1])), 1))
@@ -254,7 +284,7 @@ class ReliabilityRTCompletionNet(nn.Module):
         final_variance = (current_variance + global_mass * (trusted_variance - current_variance)
                           + global_mass * (1 - global_mass) * (trusted_joints - current_joints).square())
         history_mass = F.interpolate(masses[0], size=raw.shape[-3:], mode="trilinear", align_corners=True)
-        return {
+        result = {
             "reflection_logits": logits,
             "intensity": F.softplus(intensity),
             "log_variance": log_variance.clamp(-6, 4),
@@ -277,3 +307,8 @@ class ReliabilityRTCompletionNet(nn.Module):
             "aligned_history_intensity": aligned_intensities[0],
             "history_support": aligned_supports[0],
         }
+        if self.surface_enabled:
+            result.update(surface_points=surfaces[-1], surface_sequence=torch.stack(surfaces, 1),
+                          surface_prior=F.interpolate(surface_prior, size=raw.shape[-3:],
+                                                      mode="trilinear", align_corners=True))
+        return result

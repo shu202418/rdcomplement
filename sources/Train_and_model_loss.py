@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn as nn  # minimal add
 from torch.nn.parallel import DistributedDataParallel as DDP  # [DDP-safe]
+from mmwave_models.Tensor_models.RTmesh.kinematic_refinement import joints_to_links
 
 def batch_rodrigues(theta):
     """
@@ -110,7 +111,9 @@ def _unwrap_model(m):
 # loss function
 def combined_loss(pred_betas, pred_pose_body, pred_root_orient, pred_trans, pred_vertices, 
                   gt_betas, gt_pose_body, gt_root_orient, gt_trans, gt_vertices, 
-                  pred_genders, gt_genders, gt_center, criterion1, criterion2, gender_criterion, model, pred_center=None):
+                  pred_genders, gt_genders, gt_center, criterion1, criterion2, gender_criterion,
+                  model, pred_center=None, auxiliary=None, gt_joints=None,
+                  gt_temporal_trans=None):
     
     core = _unwrap_model(model)  # <-- DP/DDP-safe
 
@@ -133,6 +136,19 @@ def combined_loss(pred_betas, pred_pose_body, pred_root_orient, pred_trans, pred
         'vertices': vertices_loss,
         'gender': gender_loss
     }
+
+    if auxiliary is not None and gt_joints is not None:
+        gt_joints = gt_joints.to(auxiliary["refined_joints"].dtype)
+        joint_loss = criterion1(auxiliary["refined_joints"], gt_joints)
+        gt_links = joints_to_links(gt_joints, core.kinematic_head.parents)
+        skeleton_loss = criterion1(auxiliary["refined_links"], gt_links)
+        losses["joints"] = joint_loss
+        losses["skeleton"] = skeleton_loss
+
+    if auxiliary is not None and gt_temporal_trans is not None:
+        target_velocity = gt_temporal_trans[:, 1:] - gt_temporal_trans[:, :-1]
+        velocity_loss = criterion1(auxiliary["predicted_velocity"], target_velocity)
+        losses["velocity"] = velocity_loss
 
     # use weights from the unwrapped core
     weights = getattr(core, 'loss_weights', {})

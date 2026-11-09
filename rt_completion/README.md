@@ -1,5 +1,7 @@
 # M4Human：离线时序 RT 补全
 
+服务器安装、实际环境版本、最小数据清单及迁移注意事项：见[服务器环境与数据准备](../docs/RT_COMPLETION_SERVER_SETUP.md)。
+
 新版三个机制已独立实现：**部位运动混合 mask、带可靠性权重的部位对齐伪 GT、带 null 的多尺度历史融合**。
 使用 `configs/rt_completion_s2_v2.yaml`，具体流程、限制和运行命令见
 [V2 说明](../docs/rt_completion_v2.md)。原配置与下面的历史基线路径保持不变；

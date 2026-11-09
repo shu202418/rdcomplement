@@ -1,6 +1,7 @@
 """Small LMDB-only dataset, without images, point clouds or inference-time GT."""
 
 import gzip
+import math
 import pickle
 from pathlib import Path
 
@@ -36,6 +37,19 @@ def load_splits(data):
     return splits
 
 
+def deterministic_subset(values, fraction, seed):
+    """Select an exact, reproducible fraction without taking a biased prefix."""
+    if fraction is None or float(fraction) == 1.:
+        return list(values)
+    fraction = float(fraction)
+    if not 0 < fraction <= 1:
+        raise ValueError("data fraction must lie in (0,1]")
+    count = max(1, int(math.ceil(len(values) * fraction)))
+    generator = np.random.default_rng(int(seed))
+    selected = set(generator.choice(len(values), count, replace=False).tolist())
+    return [value for index, value in enumerate(values) if index in selected]
+
+
 def causal_window(indicator, allowed, length):
     """Only contiguous past frames within this split/sequence; stop at any gap."""
     if length < 1:
@@ -54,16 +68,19 @@ def causal_window(indicator, allowed, length):
 
 
 class RTSequenceDataset(Dataset):
-    def __init__(self, data, split, labels_path=None, limit=None):
+    def __init__(self, data, split, labels_path=None, limit=None, *, fraction=None,
+                 sampling_seed=42, surface_points=0):
         self.data = data
         self.split = split
         self.indicators = load_splits(data)[split]
         self.allowed = set(self.indicators)
+        self.indicators = deterministic_subset(self.indicators, fraction, sampling_seed)
         if limit is not None:
             if limit <= 0:
                 raise ValueError("limit must be positive")
             self.indicators = self.indicators[:limit]
         self.labels_path = labels_path
+        self.surface_points = int(surface_points)
         if labels_path:
             metadata = read_json(Path(labels_path) / "manifest.json")
             if metadata.get("kind") != "rt_joint_labels" or metadata.get("format_version") != FORMAT_VERSION:
@@ -74,6 +91,12 @@ class RTSequenceDataset(Dataset):
                 raise ValueError("Joint-label cache/source mismatch")
             if metadata["signature"]["data"] != data:
                 raise ValueError("Joint-label cache/protocol configuration mismatch")
+            supervision = metadata["signature"].get("supervision", {})
+            available_surface = int(supervision.get("surface_points", 0))
+            if self.surface_points and available_surface != self.surface_points:
+                raise ValueError(
+                    f"Surface supervision mismatch: requested {self.surface_points}, "
+                    f"label cache provides {available_surface}")
         if not self.indicators:
             raise ValueError(f"Empty {split} dataset")
 
@@ -115,15 +138,26 @@ class RTSequenceDataset(Dataset):
             "history_valid": torch.tensor(history[::-1]),
         }
         if self.labels_path is not None:
-            joints = []
+            joints, surfaces = [], []
             with read_env(Path(self.labels_path) / "joints.lmdb").begin() as txn:
                 for key in window:
                     blob = txn.get(frame_key(key))
                     if blob is None:
                         raise KeyError(f"Joint label missing: {key}; run prepare-labels for this split")
-                    joints.append(unpack_dict_np(blob)["joints"])
+                    record = unpack_dict_np(blob)
+                    joints.append(record["joints"])
+                    if self.surface_points:
+                        if "surface_points" not in record:
+                            raise KeyError(f"Surface label missing: {key}; rebuild V3 labels")
+                        surfaces.append(record["surface_points"])
             array = np.stack(joints).astype(np.float32)
             if array.shape != (self.data["window"], 22, 3) or not np.isfinite(array).all():
                 raise ValueError(f"Invalid joint supervision: {indicator}")
             result["joints"] = torch.from_numpy(array)
+            if self.surface_points:
+                surface = np.stack(surfaces).astype(np.float32)
+                expected = (self.data["window"], self.surface_points, 3)
+                if surface.shape != expected or not np.isfinite(surface).all():
+                    raise ValueError(f"Invalid surface supervision: {indicator}")
+                result["surface_points"] = torch.from_numpy(surface)
         return result

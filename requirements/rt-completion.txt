@@ -1,0 +1,6 @@
+# Install torch separately from the CUDA wheel index documented in
+# docs/RT_COMPLETION_SERVER_SETUP.md. These are the current verified versions.
+numpy==2.2.6
+PyYAML==6.0.3
+lmdb==1.7.3
+msgpack==1.1.1
