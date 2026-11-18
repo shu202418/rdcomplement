@@ -25,6 +25,9 @@ from .numerics import (graceful_load_scaler, make_grad_scaler, precision_policy,
                        safe_optimizer_step)
 from .progress import (DeterministicBatchSampler, capture_rng_state, group_metrics_state,
                        restore_group_metrics_state, restore_rng_state)
+from .predicted_geometry_transfer import (budget_transfer,
+                                          transfer_historical_returns,
+                                          validate_transfer_config)
 from .selection import select_additions
 from .storage import (SparseWriter, atomic_json, frame_key, read_env, read_json,
                       sha256_file, source_identity)
@@ -44,6 +47,9 @@ def load_config(path):
     loss = config["loss"]
     if loss["temporal_weight"] > 0 and not (1 <= loss["temporal_min_support"] < data["window"]):
         raise ValueError("temporal_min_support must be smaller than the temporal window")
+    teacher_mode = loss.get("temporal_teacher_mode", "articulated_joints")
+    if teacher_mode not in ("articulated_joints", "smplx_surface_transport"):
+        raise ValueError(f"Unknown temporal teacher mode: {teacher_mode}")
     architecture = config["model"].get("architecture", "baseline")
     if architecture not in ("baseline", "reliability_v2"):
         raise ValueError(f"Unknown completion architecture: {architecture}")
@@ -55,6 +61,15 @@ def load_config(path):
             raise ValueError("surface_prior requires num_points >= 4 and positive heatmap_radius_m")
         if float(config["loss"].get("surface_weight", 0)) <= 0:
             raise ValueError("surface_prior requires positive loss.surface_weight")
+    if teacher_mode == "smplx_surface_transport":
+        if architecture != "reliability_v2" or not surface.get("enabled", False):
+            raise ValueError("smplx_surface_transport requires reliability_v2 with surface_prior")
+        if loss.get("temporal_alignment", "articulated") != "articulated":
+            raise ValueError("smplx_surface_transport requires articulated alignment")
+        if not loss.get("temporal_part_frames", False):
+            raise ValueError("smplx_surface_transport requires temporal_part_frames=true")
+        if float(loss.get("teacher_splat_truncate", 1.5)) <= 0:
+            raise ValueError("teacher_splat_truncate must be positive")
     groups = config.get("validation", {}).get("groups", [])
     if groups and (len(set(groups)) != len(groups) or any(group not in ALL_MASK_GROUPS for group in groups)):
         raise ValueError("validation.groups must contain distinct supported mask groups")
@@ -372,7 +387,7 @@ def _checkpoint_due(next_step, config):
     return next_step == 1 or (every > 0 and next_step % every == 0)
 
 
-def _batch_teacher(batch, raw, joints, history, model, config):
+def _batch_teacher(batch, raw, joints, surfaces, history, model, config):
     """One immutable teacher per original batch, shared across all val masks/retries."""
     if (config["model"].get("architecture") != "reliability_v2"
             or config["loss"].get("temporal_weight", 0.) <= 0
@@ -383,6 +398,14 @@ def _batch_teacher(batch, raw, joints, history, model, config):
     if "teacher" in batch:
         return {name: value.to(raw.device, non_blocking=True).detach()
                 for name, value in batch["teacher"].items()}
+    mode = config["loss"].get("temporal_teacher_mode", "articulated_joints")
+    if mode == "smplx_surface_transport":
+        if surfaces is None:
+            raise ValueError("SMPL-X surface temporal teacher requires surface_points labels")
+        from .surface_teacher import smplx_surface_temporal_teacher
+        return smplx_surface_temporal_teacher(
+            raw, joints.detach(), surfaces.detach(), history,
+            model.bounds, model.radius, config["loss"])
     from .geometry import temporal_target_v2
     return temporal_target_v2(raw, joints.detach(), history, model.bounds, model.radius, config["loss"])
 
@@ -401,7 +424,10 @@ def prepare_teacher(args):
     config = load_config(args.config)
     return build_teacher_cache(config, args.labels, args.output, device=choose_device(args.device),
                                batch_size=args.batch_size, workers=args.workers, splits=args.splits,
-                               limit=args.limit, resume=args.resume, map_size_gb=args.map_size_gb)
+                               limit=args.limit, resume=args.resume, map_size_gb=args.map_size_gb,
+                               train_fraction=getattr(args, "train_fraction", None),
+                               val_fraction=getattr(args, "val_fraction", None),
+                               sampling_seed=getattr(args, "sampling_seed", 42))
 
 
 def run_epoch(model, batches, config, device, epoch, optimizer=None, max_steps=None,
@@ -506,7 +532,7 @@ def run_grouped_epoch(model, batches, config, device, epoch, optimizer=None, max
         surfaces = (batch["surface_points"].to(device, non_blocking=True)
                     if "surface_points" in batch else None)
         history = batch["history_valid"].to(device, non_blocking=True)
-        teacher = _batch_teacher(batch, raw, joints, history, model, config)
+        teacher = _batch_teacher(batch, raw, joints, surfaces, history, model, config)
         for group in groups:
             if training:
                 corrupted, masked, info = corrupt_rt(
@@ -534,7 +560,8 @@ def run_grouped_epoch(model, batches, config, device, epoch, optimizer=None, max
                 every = config["train"].get("detailed_metrics_every", 0)
                 detailed = not training or (every > 0 and (step + 1) % every == 0)
                 collectors[group].update(metrics, model, raw, corrupted, masked, prediction, info,
-                                         config["export"], detailed=detailed)
+                                         config["export"], history_valid=history,
+                                         detailed=detailed)
         steps = step + 1
         if training:
             if _too_many_anomalies(counts, config):
@@ -746,8 +773,43 @@ def train(args):
 
 
 @torch.no_grad()
-def prediction_to_records(model, raw, prediction, config):
-    selected = select_additions(model, raw, prediction, config)
+def prediction_to_records(model, raw, prediction, config, history_valid=None):
+    mode = config.get("mode", "learned_dense")
+    if mode == "predicted_geometry":
+        if history_valid is None:
+            raise ValueError("predicted_geometry export requires history_valid")
+        transferred = transfer_historical_returns(
+            raw, prediction, history_valid, model.bounds, model.radius,
+            config.get("predicted_geometry", {}))
+        selected = budget_transfer(transferred, config["max_added_voxels"])
+        records = []
+        for batch in range(raw.shape[0]):
+            indices = selected["accepted"][batch].flatten().nonzero().flatten()
+            indices = indices.sort().values
+
+            def values(name, dtype):
+                return (selected[name][batch].flatten()[indices].cpu().numpy().astype(dtype))
+
+            records.append({
+                "indices": indices.cpu().numpy().astype(np.int32),
+                "values": values("values", np.float32),
+                # Legacy field names remain readable by existing diagnostics.
+                "probability": values("confidence", np.float16),
+                "sigma_log": values("intensity_disagreement_log", np.float16),
+                "confidence": values("confidence", np.float16),
+                "support_count": values("support_count", np.uint8),
+                "alignment_quality": values("alignment_quality", np.float16),
+                "intensity_disagreement_log": values(
+                    "intensity_disagreement_log", np.float16),
+                "intensity_cv": values("intensity_cv", np.float16),
+                "joint_sigma_m": values("joint_sigma_m", np.float16),
+                "joints": selected["joints"][batch].cpu().numpy().astype(np.float32),
+            })
+        return records
+    if mode != "learned_dense":
+        raise ValueError(f"Unknown export mode: {mode}")
+    selected = select_additions(
+        model, raw, prediction, config, history_valid=history_valid)
     probability, sigma, values = selected["probability"], selected["sigma"], selected["values"]
     records = []
     for batch in range(raw.shape[0]):
@@ -857,25 +919,91 @@ def export(args):
         raise ValueError("Not an offline RT completion checkpoint")
     if not checkpoint.get("epoch_complete", True):
         raise ValueError("Incomplete training checkpoint: resume progress.pt first; export a validated best.pt/last.pt")
+    expected_epoch = getattr(args, "expected_epoch", None)
+    if expected_epoch is not None and checkpoint["epoch"] + 1 != expected_epoch:
+        raise ValueError(
+            f"Checkpoint epoch mismatch: requested {expected_epoch}, "
+            f"found {checkpoint['epoch'] + 1}"
+        )
     config = checkpoint["config"]
     if any(value is not None for value in checkpoint["debug_limits"].values()):
         print("WARNING: exporting a limited/debug training checkpoint; do not interpret it as a validated model", flush=True)
     data = config["data"]
-    settings = dict(config["export"])
+    settings = copy.deepcopy(config["export"])
+    export_config_path = getattr(args, "export_config", None)
+    if export_config_path:
+        with open(export_config_path, encoding="utf-8") as stream:
+            override = yaml.safe_load(stream)
+        if not isinstance(override, dict) or not isinstance(override.get("export"), dict):
+            raise ValueError("Export configuration must contain an export mapping")
+        if "data" in override:
+            override_data = copy.deepcopy(override["data"])
+            if "cache_path" in override_data:
+                override_data["cache_path"] = str(Path(override_data["cache_path"]).resolve())
+            mismatched = [key for key, value in override_data.items()
+                          if key in data and value != data[key]]
+            if mismatched:
+                raise ValueError(
+                    "Export configuration does not match checkpoint data: " + ", ".join(mismatched))
+        settings = copy.deepcopy(override["export"])
+    transfer_mode = getattr(args, "transfer_mode", None)
+    if transfer_mode is not None:
+        settings["mode"] = transfer_mode
+    mode = settings.get("mode", "learned_dense")
     if args.probability_threshold is not None:
         settings["probability_threshold"] = args.probability_threshold
     if args.max_added_voxels is not None:
         settings["max_added_voxels"] = args.max_added_voxels
-    if not 0 <= settings["probability_threshold"] <= 1 or settings["max_added_voxels"] < 0:
-        raise ValueError("Invalid export thresholds")
+    if getattr(args, "min_history_mass", None) is not None:
+        settings["min_history_mass"] = args.min_history_mass
+    if getattr(args, "body_threshold", None) is not None:
+        settings["body_threshold"] = args.body_threshold
+    if getattr(args, "min_history_frames", None) is not None:
+        settings["min_history_frames"] = args.min_history_frames
+    if settings["max_added_voxels"] < 0:
+        raise ValueError("max_added_voxels must be non-negative")
+    if mode == "learned_dense":
+        if (not 0 <= settings["probability_threshold"] <= 1
+                or not 0 <= float(settings.get("min_history_mass", 0.)) <= 1
+                or not 0 <= float(settings["body_threshold"]) <= 1
+                or int(settings.get("min_history_frames", 0)) < 0
+                or int(settings.get("min_history_frames", 0)) > data["window"] - 1):
+            raise ValueError("Invalid learned_dense export thresholds")
+    elif mode == "predicted_geometry":
+        if config["model"].get("architecture", "baseline") != "reliability_v2":
+            raise ValueError("predicted_geometry export requires architecture=reliability_v2")
+        validate_transfer_config(settings.get("predicted_geometry", {}), data["window"])
+    else:
+        raise ValueError(f"Unknown export mode: {mode}")
     identity = source_identity(data["cache_path"])
     if identity != checkpoint["source"]:
         raise ValueError("Checkpoint was trained with a different/modified radar source or split file")
     device = choose_device(args.device)
     model = RTCompletionNet(data, config["model"]).to(device).eval()
     model.load_state_dict(checkpoint["model"])
+    fractions = {
+        split: getattr(args, f"{split}_fraction", None)
+        for split in ("train", "val", "test")
+    }
+    sampling_seed = int(getattr(args, "sampling_seed", config["train"]["seed"]))
     signature = {"source": identity, "data": data, "settings": settings,
-                 "checkpoint_sha256": sha256_file(args.checkpoint), "geometry": "predicted_from_rt_only"}
+                 "checkpoint_sha256": sha256_file(args.checkpoint),
+                 "geometry": "predicted_from_rt_only",
+                 "completion_method": mode,
+                 "intensity_source": ("historical_measured_rt"
+                                      if mode == "predicted_geometry" else "network_prediction"),
+                 "uses_gt_at_inference": False}
+    if any(value is not None for value in fractions.values()):
+        # A subset cache stores every temporal context frame needed by the
+        # selected targets.  This keeps four-frame downstream windows intact
+        # without pretending that the cache covers all target frames.
+        signature["target_subset"] = {
+            "fractions": {
+                split: 1.0 if value is None else float(value)
+                for split, value in fractions.items()
+            },
+            "sampling_seed": sampling_seed,
+        }
     splits = load_splits(data)
     with output_lock(args.output, data["cache_path"]) as output:
         manifest = init_manifest(output, "rt_additions", signature, args.resume)
@@ -887,12 +1015,35 @@ def export(args):
         try:
             existing = writer.keys()
             for split in args.splits:
-                dataset = RTSequenceDataset(data, split, labels_path=None, limit=args.limit)
+                full = splits[split]
+                split_seed = sampling_seed + {"train": 0, "val": 100000, "test": 200000}[split]
+                all_targets = deterministic_subset(full, fractions[split], split_seed)
+                targets = all_targets
+                if args.limit:
+                    targets = targets[:args.limit]
+                allowed = set(full)
+                all_needed = sorted({
+                    key
+                    for target in all_targets
+                    for key in causal_window(target, allowed, data["window"])
+                })
+                needed = sorted({
+                    key
+                    for target in targets
+                    for key in causal_window(target, allowed, data["window"])
+                })
+                dataset = RTSequenceDataset(data, split, labels_path=None)
+                dataset.indicators = [
+                    key for key in needed if frame_key(key) not in existing
+                ]
                 # Keep the full allowed set for context even when targets are
                 # restricted for a dry run or removed by resumable export.
-                dataset.indicators = [key for key in dataset.indicators if frame_key(key) not in existing]
                 batches = loader(dataset, args.batch_size, args.workers, device=device)
-                print(f"Export {split}: {len(dataset)} pending frames; GT/SMPL-X disabled", flush=True)
+                print(
+                    f"Export {split}: {len(targets)} targets, {len(needed)} target/context records, "
+                    f"{len(dataset)} pending; GT/SMPL-X disabled",
+                    flush=True,
+                )
                 done_now, added_now = 0, 0
                 with torch.inference_mode():
                     for batch in batches:
@@ -901,7 +1052,8 @@ def export(args):
                         prediction = model(raw, history_valid=history)
                         if not finite_prediction(prediction):
                             raise FloatingPointError("Non-finite completion prediction")
-                        records = prediction_to_records(model, raw, prediction, settings)
+                        records = prediction_to_records(
+                            model, raw, prediction, settings, history_valid=history)
                         pairs = list(zip(batch["indicator"].tolist(), records))
                         writer.put_many(pairs)
                         existing.update(frame_key(key) for key, _ in pairs)
@@ -909,9 +1061,18 @@ def export(args):
                         added_now += sum(len(record["indices"]) for record in records)
                         if done_now == len(records) or done_now % (args.batch_size * 100) == 0:
                             print(f"  {split}: {done_now}/{len(dataset)}, mean additions={added_now / done_now:.1f}", flush=True)
-                done = sum(frame_key(key) in existing for key in splits[split])
-                manifest["partitions"][split] = {"expected": len(splits[split]), "written": done,
-                                                  "complete": done == len(splits[split])}
+                done = sum(frame_key(key) in existing for key in all_needed)
+                manifest["partitions"][split] = {
+                    "expected": len(all_needed),
+                    "written": done,
+                    "complete": done == len(all_needed),
+                    "full_targets": len(full),
+                    "selected_targets": len(all_targets),
+                    "target_fraction": 1.0 if fractions[split] is None else float(fractions[split]),
+                    "sampling_seed": split_seed,
+                }
+                if args.limit:
+                    manifest["partitions"][split]["debug_target_limit"] = int(args.limit)
                 atomic_json(output / "manifest.json", manifest)
             manifest["state"] = "complete" if all(manifest["partitions"].get(s, {}).get("complete", False)
                                                    for s in ("train", "val", "test")) else "partial"
@@ -933,9 +1094,18 @@ def write_m4human_config(args):
     config["paths"]["cached_root"] = str(Path(data["cache_path"]).parent)
     config["paths"]["rt_completion_cache"] = str(Path(args.cache).resolve())
     config["dataset"].update(scale=data["scale"], split=data["protocol"])
+    subset = manifest["signature"].get("target_subset")
+    if subset:
+        config["dataset"]["target_fractions"] = dict(subset["fractions"])
+        config["dataset"]["subset_seed"] = int(subset["sampling_seed"])
+    else:
+        config["dataset"].pop("target_fractions", None)
+        config["dataset"].pop("subset_seed", None)
     config["model"].update(name="RT-Mesh", modality="rawImage_XYZ")
     config["train"].update(resume_path="", resume_start_epoch=0)
-    config["eval"].update(test_mode=False, test_model_path="")
+    # Select checkpoints on validation.  Test remains untouched until a
+    # separate final evaluation run.
+    config["eval"].update(test_mode=False, test_model_path="", selection_split="val")
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "x", encoding="utf-8") as stream:
         yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)

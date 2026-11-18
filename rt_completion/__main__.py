@@ -52,6 +52,11 @@ def main():
     teacher.add_argument("--workers", type=int, default=0)
     teacher.add_argument("--map-size-gb", type=positive, default=32, help="Initial LMDB virtual map; grows on demand")
     teacher.add_argument("--limit", type=positive, help="Debug only: incomplete cache, rejected by training")
+    teacher.add_argument("--train-fraction", type=fraction,
+                         help="Deterministic fraction matching completion training")
+    teacher.add_argument("--val-fraction", type=fraction,
+                         help="Deterministic fraction matching validation")
+    teacher.add_argument("--sampling-seed", type=int, default=42)
     teacher.add_argument("--resume", action="store_true", help="Skip already committed frames in a matching cache")
     teacher.set_defaults(func=pipeline.prepare_teacher)
 
@@ -75,13 +80,30 @@ def main():
 
     export = commands.add_parser("export", help="RT-only inference; save sparse additions per frame")
     export.add_argument("--checkpoint", required=True)
+    export.add_argument("--export-config",
+                        help="Optional YAML export block overriding checkpoint export settings")
+    export.add_argument("--transfer-mode", choices=("learned_dense", "predicted_geometry"),
+                        help="Completion rule; predicted_geometry transfers measured historical RT")
+    export.add_argument("--expected-epoch", type=positive,
+                        help="Fail unless checkpoint is from this completed epoch")
     export.add_argument("--output", required=True)
     export.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val", "test"])
     export.add_argument("--limit", type=positive, help="Debug only: intentionally INCOMPLETE cache")
+    export.add_argument("--train-fraction", type=fraction,
+                        help="Deterministic fraction of downstream training targets")
+    export.add_argument("--val-fraction", type=fraction,
+                        help="Deterministic fraction of downstream validation targets")
+    export.add_argument("--test-fraction", type=fraction,
+                        help="Deterministic fraction of downstream test targets")
+    export.add_argument("--sampling-seed", type=int, default=42,
+                        help="Target-subset seed; val/test use fixed disjoint offsets")
     export.add_argument("--batch-size", type=positive, default=2)
     export.add_argument("--workers", type=int, default=0)
     export.add_argument("--probability-threshold", type=float)
     export.add_argument("--max-added-voxels", type=int)
+    export.add_argument("--min-history-frames", type=nonnegative)
+    export.add_argument("--min-history-mass", type=float)
+    export.add_argument("--body-threshold", type=float)
     export.add_argument("--resume", action="store_true")
     export.set_defaults(func=pipeline.export)
 
@@ -127,6 +149,11 @@ def main():
     visualize_completion.add_argument("--split", choices=("train", "val", "test"), default="val")
     visualize_completion.add_argument("--indices", nargs="+", type=nonnegative, default=[0],
                                       help="Dataset positions in the selected split")
+    visualize_completion.add_argument("--probability-threshold", type=float)
+    visualize_completion.add_argument("--max-added-voxels", type=nonnegative)
+    visualize_completion.add_argument("--min-history-frames", type=nonnegative)
+    visualize_completion.add_argument("--min-history-mass", type=float)
+    visualize_completion.add_argument("--body-threshold", type=float)
     visualize_completion.set_defaults(func=pipeline.visualize_completion)
 
     prune = commands.add_parser(

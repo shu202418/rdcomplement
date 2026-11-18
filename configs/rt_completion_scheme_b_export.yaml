@@ -1,0 +1,23 @@
+# Scheme B deployment: predicted RT-only joints establish correspondence and
+# admissible body regions; measured historical RT supplies every added value.
+# This file changes export only and can be used with an existing reliability_v2
+# checkpoint. It never opens GT joints, SMPL-X labels, or surface labels.
+export:
+  mode: predicted_geometry
+  max_added_voxels: 128
+  map_size_gb: 8
+  predicted_geometry:
+    # At least two distinct, non-padding historical frames must agree.
+    min_support_frames: 2
+    support_threshold: 0.20
+    body_threshold: 0.20
+    confidence_threshold: 0.20
+    consistency_scale_log: 0.35
+    uncertainty_scale_m: 0.15
+    max_joint_sigma_m: 0.30
+    max_intensity_cv: 1.0
+    min_intensity: 0.000001
+    # Only spread transported returns to immediately adjacent voxels.
+    splat_sigma_m: [0.05, 0.05, 0.10]
+    splat_radius_voxels: [1, 1, 1]
+    use_part_frames: true
